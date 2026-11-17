@@ -491,6 +491,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
 <main id="app"></main>
 <script>
 var atoken = localStorage.getItem('quiz_admin_token') || '';
+var pendingToken = '';
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function api(path, opts){
   opts = opts || {};
@@ -512,7 +513,7 @@ function doSetup(){
   if (!p) return;
   fetch('/api/auth/setup', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:p})})
     .then(function(r){return r.json();}).then(function(d){
-      if (d.ok) { atoken = d.token; localStorage.setItem('quiz_admin_token', atoken); renderDash(); showAgentToken(d.agentToken); }
+      if (d.ok) { atoken = d.token; localStorage.setItem('quiz_admin_token', atoken); pendingToken = d.agentToken || ''; renderDash(); }
       else alert(d.error||'エラー');
     });
 }
@@ -524,18 +525,14 @@ function doLogin(){
       else alert(d.error||'パスワードが違います');
     });
 }
-function showAgentToken(t){
-  if (!t) return;
-  var div = document.createElement('div');
-  div.className = 'card';
-  div.innerHTML = '<h2>イロ連携トークン（大切）</h2><p class="hint">このトークンをイロとのチャットで伝えてください。表示はこの1回だけです（忘れたら下の「再生成」で作り直せます）。</p><div class="token">'+esc(t)+'</div>';
-  document.getElementById('app').prepend(div);
-}
+function dismissToken(){ pendingToken=''; renderDash(); }
 function renderDash(){
   api('/api/admin/state').then(function(d){
     if (!d.ok) { renderAuth('login'); return; }
     var app = document.getElementById('app');
-    var h = '<div class="card"><h1>毎朝5問｜管理画面</h1>';
+    var h = '';
+    if (pendingToken) h += '<div class="card"><h2>イロ連携トークン（大切）</h2><p class="hint">このトークンをイロとのチャットで伝えてください。コピーできたら「確認した」を押してください（忘れたら設定の「再生成」で作り直せます）。</p><div class="token">'+esc(pendingToken)+'</div><p style="margin-top:10px"><button class="sub" onclick="dismissToken()">確認した</button></p></div>';
+    h += '<div class="card"><h1>毎朝5問｜管理画面</h1>';
     var t = d.today;
     h += '<h2>今日（'+esc(t.date)+'）</h2>';
     if (!t.hasQuestions) h += '<p class="hint">今日の問題はまだ投入されていません（毎朝6:30にイロが入れます）。</p>';
@@ -574,7 +571,7 @@ function setPass(){
 function regen(){
   if (!confirm('トークンを作り直します。新しいトークンをイロに伝えるまで、問題の自動投入と結果確認が止まります。よろしいですか？')) return;
   api('/api/admin/regen-token', {method:'POST', body:{}}).then(function(d){
-    if (d.ok) { renderDash(); showAgentToken(d.agentToken); }
+    if (d.ok) { pendingToken = d.agentToken || ''; renderDash(); }
     else alert(d.error||'エラー');
   });
 }
