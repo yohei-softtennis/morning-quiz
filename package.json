@@ -1,0 +1,1 @@
+{"description":"毎朝5問｜理科・社会（公開Webアプリ版）","engines":{"node":">=18"},"main":"server.js","name":"morning-quiz","scripts":{"start":"node server.js"},"version":"1.0.0"}
