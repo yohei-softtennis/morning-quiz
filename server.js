@@ -20,7 +20,8 @@ function blankData() {
     agentTokenHash: null,         // 連携トークン（ハッシュで保存）
     playerTokens: [],             // プレイヤーのログイン済みトークン（ハッシュ）
     days: {},                     // 'YYYY-MM-DD': {questions:[], extraPool:[], answers:{}, extraSets:[[answers...]], extraUsed:0}
-    tests: {},                    // weekStart 'YYYY-MM-DD': {attempts:[{date,correct,total,passed}], passed:false, lastPool:[qid...]}
+    tests: {},                    // weekStart 'YYYY-MM-DD': {attempts:[{date,correct,total,passed,missedUnits:[{subject,unit}]}], passed:false, lastPool:[qid...], lastMissed:[{subject,unit,qid}], usedVariantIds:[id...]}
+    testVariants: {},             // weekStart 'YYYY-MM-DD': [variantQuestion...] 週末テストの再出題用バリエーション問題
   };
 }
 let data = blankData();
@@ -190,17 +191,42 @@ function testPool(weekStart) {
   }
   return pool;
 }
+function testVariantsFor(weekStart, subject, unit) {
+  return ((data.testVariants && data.testVariants[weekStart]) || []).filter((v) => v.subject === subject && v.unit === unit);
+}
 function testState() {
   const { weekStart, weekEnd } = testWeek();
   const rec = data.tests[weekStart] || { attempts: [], passed: false, lastPool: null };
+  const all = testPool(weekStart);
   let pool;
   if (rec.passed) pool = [];
+  else if (rec.lastMissed && rec.lastMissed.length > 0) {
+    /* 前回のテストで間違えた単元をもう一度出す。バリエーション問題があれば
+       未使用のものを優先し、同じ問題の丸暗記では解けないようにする。 */
+    const used = new Set(rec.usedVariantIds || []);
+    const varIx = {};
+    pool = [];
+    rec.lastMissed.forEach((m) => {
+      const vars = testVariantsFor(weekStart, m.subject, m.unit);
+      const fresh = vars.filter((v) => !used.has(v.id));
+      const ix = varIx[m.subject + '|' + m.unit] || 0;
+      varIx[m.subject + '|' + m.unit] = ix + 1;
+      if (fresh[ix]) pool.push(fresh[ix]);
+      else {
+        const orig = all.find((q) => q.id === m.qid) || all.find((q) => q.subject === m.subject && q.unit === m.unit);
+        if (orig) pool.push(orig);
+        else if (vars.length > 0) pool.push(vars[vars.length - 1]);
+      }
+    });
+    const seen = {};
+    pool = pool.filter((q) => q && !seen[q.id] && (seen[q.id] = true));
+    if (pool.length === 0) pool = all;
+  }
   else if (rec.lastPool && rec.lastPool.length > 0) {
-    const all = testPool(weekStart);
     pool = all.filter((q) => rec.lastPool.includes(q.id));
     if (pool.length === 0) pool = all;
-  } else pool = testPool(weekStart);
-  return { weekStart, weekEnd, available: pool.length > 0 && !rec.passed, passed: rec.passed, needless: testPool(weekStart).length === 0, pool, attempts: rec.attempts || [] };
+  } else pool = all;
+  return { weekStart, weekEnd, available: pool.length > 0 && !rec.passed, passed: rec.passed, needless: all.length === 0, pool, attempts: rec.attempts || [] };
 }
 
 /* ---------------- プレイヤー画面 ---------------- */
@@ -417,7 +443,7 @@ function nextQ(){
       var app = document.getElementById('app');
       var h = '<div class="card center"><h2>週末テスト結果</h2>';
       h += '<div class="resultbig">'+d.correct+' / '+d.total+'</div>';
-      h += d.passed ? '<p class="ok" style="font-size:19px">🎉 合格！</p>' : '<p class="miss" style="font-size:17px">あと少し！80%で合格です</p><p class="hint">間違えた問題だけでもう一度テストします</p>';
+      h += d.passed ? '<p class="ok" style="font-size:19px">🎉 合格！</p>' : '<p class="miss" style="font-size:17px">あと少し！80%で合格です</p><p class="hint">間違えた単元の問題を、出し方を変えてもう一度テストします</p>';
       h += '<p><button onclick="loadToday()">ホームへ</button></p></div>';
       app.innerHTML = h;
     });
@@ -735,18 +761,29 @@ const server = http.createServer(async (req, res) => {
       const ts = testState();
       if (!ts.available) return sendJson(res, 400, { ok: false, error: 'テストがありません' });
       const byId = {}; ts.pool.forEach((q) => { byId[q.id] = q; });
-      let correct = 0; const missed = [];
+      let correct = 0; const missed = []; const missedEntries = [];
       (body.results || []).forEach((r) => {
         const q = byId[r.qid];
         if (!q) return;
-        if (r.choice === q.answer) correct++; else missed.push(r.qid);
+        if (r.choice === q.answer) correct++;
+        else { missed.push(r.qid); missedEntries.push({ subject: q.subject, unit: q.unit, qid: q.originId || q.id }); }
       });
       const total = ts.pool.length;
       const passed = total > 0 && correct / total >= 0.8;
       if (!data.tests[ts.weekStart]) data.tests[ts.weekStart] = { attempts: [], passed: false, lastPool: null };
       const rec = data.tests[ts.weekStart];
-      rec.attempts.push({ date: todayStr(), correct, total, passed });
-      if (passed) { rec.passed = true; rec.lastPool = null; } else rec.lastPool = missed;
+      const muSeen = {}; const missedUnits = [];
+      missedEntries.forEach((m) => { const k = m.subject + '|' + m.unit; if (!muSeen[k]) { muSeen[k] = true; missedUnits.push({ subject: m.subject, unit: m.unit }); } });
+      rec.attempts.push({ date: todayStr(), correct, total, passed, missedUnits });
+      if (passed) { rec.passed = true; rec.lastPool = null; rec.lastMissed = null; }
+      else {
+        rec.lastPool = missed;
+        rec.lastMissed = missedEntries;
+        const servedVariantIds = ts.pool.filter((q) => q.isVariant).map((q) => q.id);
+        rec.usedVariantIds = [...new Set([...(rec.usedVariantIds || []), ...servedVariantIds])];
+        const allVarIds = ((data.testVariants && data.testVariants[ts.weekStart]) || []).map((v) => v.id);
+        if (allVarIds.length > 0 && allVarIds.every((id) => rec.usedVariantIds.includes(id))) rec.usedVariantIds = servedVariantIds;
+      }
       saveData();
       return sendJson(res, 200, { ok: true, correct, total, passed });
     }
@@ -828,6 +865,20 @@ const server = http.createServer(async (req, res) => {
       saveData();
       return sendJson(res, 200, { ok: true, date, count: qs.length, extraCount: xs.length });
     }
+    if (req.method === 'POST' && p === '/api/agent/test-variants') {
+      const body = await readBody(req);
+      const weekStart = body.weekStart;
+      if (!validDateStr(weekStart) || !Array.isArray(body.variants) || body.variants.length === 0 || !body.variants.every(validQuestion)) {
+        return sendJson(res, 400, { ok: false, error: 'variants の形式が不正です' });
+      }
+      if (!data.testVariants) data.testVariants = {};
+      if (!data.testVariants[weekStart]) data.testVariants[weekStart] = [];
+      const base = data.testVariants[weekStart].length;
+      const vs = body.variants.map((q, i) => ({ id: weekStart + '-tv' + (base + i + 1), subject: q.subject, unit: q.unit, q: q.q, choices: q.choices, answer: q.answer, explanation: q.explanation, memoryTip: q.memoryTip, diagram: cleanDiagram(q.diagram), isVariant: true, originId: null }));
+      data.testVariants[weekStart].push(...vs);
+      saveData();
+      return sendJson(res, 200, { ok: true, weekStart, added: vs.length, total: data.testVariants[weekStart].length });
+    }
     if (req.method === 'GET' && p === '/api/agent/results') {
       const date = url.searchParams.get('date') || todayStr();
       const day = dayOf(date);
@@ -850,7 +901,7 @@ const server = http.createServer(async (req, res) => {
         recentMissed: recentMissedUnits(14),
         units: unitStats(),
         week: weeklyAccuracy(),
-        test: (() => { const ts = testState(); return { weekStart: ts.weekStart, available: ts.available, passed: ts.passed, needless: ts.needless, poolSize: ts.pool.length }; })(),
+        test: (() => { const ts = testState(); const rec = data.tests[ts.weekStart] || { attempts: [] }; const mu = {}; (rec.attempts || []).forEach((a) => (a.missedUnits || []).forEach((u) => { const k = u.subject + '|' + u.unit; if (!mu[k]) mu[k] = { subject: u.subject, unit: u.unit, count: 0 }; mu[k].count++; })); return { weekStart: ts.weekStart, available: ts.available, passed: ts.passed, needless: ts.needless, poolSize: ts.pool.length, testMissedUnits: Object.values(mu), variantsStored: ((data.testVariants && data.testVariants[ts.weekStart]) || []).length }; })(),
         days: Object.keys(data.days).sort().slice(-14),
       });
     }
