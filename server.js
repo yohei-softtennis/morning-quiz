@@ -22,6 +22,8 @@ function blankData() {
     days: {},                     // 'YYYY-MM-DD': {questions:[], extraPool:[], answers:{}, extraSets:[[answers...]], extraUsed:0}
     tests: {},                    // weekStart 'YYYY-MM-DD': {attempts:[{date,correct,total,passed,missedUnits:[{subject,unit}]}], passed:false, lastPool:[qid...], lastMissed:[{subject,unit,qid}], usedVariantIds:[id...]}
     testVariants: {},             // weekStart 'YYYY-MM-DD': [variantQuestion...] 週末テストの再出題用バリエーション問題
+    pushSubs: [],                 // プレイヤーのプッシュ通知の購読（endpoint単位）
+    pushVapid: null,              // Web Push の VAPID 鍵 {publicKey, privateKey}（初回に生成して保存）
   };
 }
 let data = blankData();
@@ -40,6 +42,23 @@ function saveData() {
   } catch (e) { console.error('saveData error', e); }
 }
 loadData();
+
+/* ---------------- プッシュ通知 ---------------- */
+let _wp = null;
+function getWebPush() {
+  if (_wp) return _wp;
+  let wp;
+  try { wp = require('web-push'); } catch (e) { console.error('web-push not installed'); return null; }
+  if (!data.pushVapid) {
+    const k = wp.generateVAPIDKeys();
+    data.pushVapid = { publicKey: k.publicKey, privateKey: k.privateKey };
+    saveData();
+  }
+  wp.setVapidDetails('mailto:youhei990726@muse.ai', data.pushVapid.publicKey, data.pushVapid.privateKey);
+  _wp = wp;
+  return wp;
+}
+const SW_SCRIPT = "self.addEventListener('push', function(e){ var d={}; try{ d=e.data.json(); }catch(x){} var t=d.title||'毎朝5問クイズ'; var o={ body:d.body||'', icon:undefined, data:{ url:d.url||'/' } }; e.waitUntil(self.registration.showNotification(t,o)); }); self.addEventListener('notificationclick', function(e){ e.notification.close(); var u=(e.notification.data&&e.notification.data.url)||'/'; e.waitUntil(clients.matchAll({type:'window', includeUncontrolled:true}).then(function(cs){ for(var i=0;i<cs.length;i++){ if(cs[i].url.indexOf(u)>=0) return cs[i].focus(); } return clients.openWindow(u); })); });";
 
 /* ---------------- 認証まわり ---------------- */
 function hashSecret(secret) {
@@ -325,6 +344,37 @@ function doLogin(){
       else renderGate('あいことばが違うみたい。もう一度確認してね');
     }).catch(function(){ renderGate('通信エラー。もう一度試してね'); });
 }
+function urlB64ToU8(base64String){
+  var padding = '='.repeat((4 - base64String.length % 4) % 4);
+  var base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  var raw = window.atob(base64);
+  var arr = new Uint8Array(raw.length);
+  for (var i = 0; i < raw.length; ++i) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+function pushSetup(){
+  var msg = document.getElementById('pushmsg');
+  function say(t){ if (msg) msg.textContent = t; }
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) { say('このブラウザでは通知が使えません。Chromeで開いてね'); return; }
+  say('設定中…');
+  navigator.serviceWorker.register('/sw.js').then(function(reg){
+    return Notification.requestPermission().then(function(perm){
+      if (perm !== 'granted') { say('通知が許可されませんでした。ブラウザの設定で許可してね'); return null; }
+      return reg.pushManager.getSubscription().then(function(sub){
+        if (sub) return sub;
+        return fetch('/api/push/key').then(function(r){ return r.json(); }).then(function(k){
+          return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToU8(k.publicKey) });
+        });
+      });
+    }).then(function(sub){
+      if (!sub) return;
+      return api('/api/push/subscribe', { method: 'POST', body: sub.toJSON() }).then(function(d){
+        if (d && d.ok) say('登録できました！夕方5時に、まだ終わっていない日だけお知らせするよ');
+        else say('登録に失敗しました。もう一度試してね');
+      });
+    });
+  }).catch(function(e){ say('うまくいきませんでした。もう一度試してね'); });
+}
 function loadToday(){
   api('/api/player/today').then(function(d){ S = d; renderHome(); }).catch(function(e){ if (String(e)!=='Error: auth') document.getElementById('app').innerHTML='<div class="card">読み込みに失敗しました。電波のいいところでもう一度開いてね。</div>'; });
 }
@@ -354,6 +404,7 @@ function renderHome(){
     h += '<p><button onclick="startMain()">'+(answered>0?'つづきから解く':'はじめる')+'</button></p>';
   }
   h += '</div>';
+  h += '<div class="card"><h2>リマインド通知</h2><p class="hint">夕方5時に、その日のクイズがまだ終わっていない日だけ、スマホにお知らせが届きます。</p><p><button class="sub" onclick="pushSetup()">通知を受け取る</button></p><p class="hint" id="pushmsg"></p></div>';
   if (S.test && (S.test.available || S.test.passed)) {
     h += '<div class="card"><h2>週末テスト</h2>';
     if (S.test.passed) h += '<p class="ok">✅ 合格済みです。よくがんばった！</p>';
@@ -844,8 +895,43 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, agentToken });
     }
 
+    /* ---- プッシュ通知 ---- */
+    if (req.method === 'GET' && p === '/sw.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-cache' });
+      return res.end(SW_SCRIPT);
+    }
+    if (req.method === 'GET' && p === '/api/push/key') {
+      const wp = getWebPush();
+      if (!wp || !data.pushVapid) return sendJson(res, 500, { ok: false, error: 'push未設定' });
+      return sendJson(res, 200, { ok: true, publicKey: data.pushVapid.publicKey });
+    }
+    if (req.method === 'POST' && p === '/api/push/subscribe') {
+      if (!isPlayer(req)) return sendJson(res, 401, { ok: false, error: 'ログインが必要です' });
+      const body = await readBody(req);
+      if (!body || !body.endpoint || !body.keys || !body.keys.p256dh || !body.keys.auth) return sendJson(res, 400, { ok: false, error: '購読の形式が不正です' });
+      if (!Array.isArray(data.pushSubs)) data.pushSubs = [];
+      data.pushSubs = data.pushSubs.filter((x) => x.endpoint !== body.endpoint);
+      data.pushSubs.push({ endpoint: body.endpoint, keys: { p256dh: body.keys.p256dh, auth: body.keys.auth }, created_at: new Date().toISOString() });
+      saveData();
+      return sendJson(res, 200, { ok: true, count: data.pushSubs.length });
+    }
+
     /* ---- 連携（イロ） ---- */
     if (p.startsWith('/api/agent/') && !isAgent(req)) return sendJson(res, 401, { ok: false, error: 'トークンが違います' });
+    if (req.method === 'POST' && p === '/api/agent/push/notify') {
+      const body = await readBody(req);
+      const wp = getWebPush();
+      if (!wp) return sendJson(res, 500, { ok: false, error: 'push未設定' });
+      const payload = JSON.stringify({ title: String(body.title || '毎朝5問クイズ'), body: String(body.body || ''), url: '/' });
+      const subs = Array.isArray(data.pushSubs) ? data.pushSubs : [];
+      let sent = 0; const dead = [];
+      for (const sub of subs) {
+        try { await wp.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, payload); sent++; }
+        catch (e) { if (e && (e.statusCode === 404 || e.statusCode === 410)) dead.push(sub.endpoint); }
+      }
+      if (dead.length) { data.pushSubs = subs.filter((x) => !dead.includes(x.endpoint)); saveData(); }
+      return sendJson(res, 200, { ok: true, sent, pruned: dead.length, total: subs.length });
+    }
     if (req.method === 'POST' && p === '/api/agent/questions') {
       const body = await readBody(req);
       const date = body.date;
