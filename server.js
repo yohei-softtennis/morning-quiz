@@ -16,7 +16,9 @@ const DATA_FILE = path.join(DATA_DIR, 'quiz-data.json');
 function blankData() {
   return {
     adminPasswordHash: null,      // scrypt$hex$salt 形式
-    playerPassHash: null,         // あいことば（プレイヤー用）
+    playerPassHash: null,         // あいことば（プレイヤー用：息子）
+    player2PassHash: null,        // あいことば（娘用）
+    profiles: null,               // プレイヤー別データ {son:{days,tests,testVariants}, daughter:{...}}
     agentTokenHash: null,         // 連携トークン（ハッシュで保存）
     playerTokens: [],             // プレイヤーのログイン済みトークン（ハッシュ）
     days: {},                     // 'YYYY-MM-DD': {questions:[], extraPool:[], answers:{}, extraSets:[[answers...]], extraUsed:0}
@@ -42,6 +44,18 @@ function saveData() {
   } catch (e) { console.error('saveData error', e); }
 }
 loadData();
+(function migrateProfiles() {
+  if (!data.profiles) {
+    data.profiles = {
+      son: { days: data.days || {}, tests: data.tests || {}, testVariants: data.testVariants || {} },
+      daughter: { days: {}, tests: {}, testVariants: {} },
+    };
+  }
+  if (!data.profiles.daughter) data.profiles.daughter = { days: {}, tests: {}, testVariants: {} };
+  ['son', 'daughter'].forEach((w) => { const pr = data.profiles[w]; pr.days = pr.days || {}; pr.tests = pr.tests || {}; pr.testVariants = pr.testVariants || {}; });
+  data.days = data.profiles.son.days; data.tests = data.profiles.son.tests; data.testVariants = data.profiles.son.testVariants;
+})();
+function prof(who) { return data.profiles[who === 'daughter' ? 'daughter' : 'son']; }
 
 /* ---------------- プッシュ通知 ---------------- */
 let _wp = null;
@@ -91,11 +105,15 @@ function isAgent(req) {
   if (!t || !data.agentTokenHash) return false;
   return sha256(t) === data.agentTokenHash;
 }
-function isPlayer(req) {
+function playerWho(req) {
   const t = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '');
-  if (!t) return false;
-  return data.playerTokens.includes(sha256(t));
+  if (!t) return null;
+  const h = sha256(t);
+  const e = (data.playerTokens || []).find((x) => (typeof x === 'string' ? x : x.h) === h);
+  if (!e) return null;
+  return (typeof e === 'string' || !e.who) ? 'son' : e.who;
 }
+function isPlayer(req) { return !!playerWho(req); }
 
 /* ---------------- 日付（日本時間） ---------------- */
 function jstNow() { return new Date(Date.now() + 9 * 3600 * 1000); }
@@ -111,7 +129,7 @@ function lastSunday(s) { const d = parseDate(s); const dow = d.getUTCDay(); d.se
 function validDateStr(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s || ''); }
 
 /* ---------------- 計算 ---------------- */
-function dayOf(date) { return data.days[date] || null; }
+function dayOf(P, date) { return P.days[date] || null; }
 function mainDone(day) {
   if (!day || !day.questions || day.questions.length === 0) return false;
   return day.questions.every((q) => day.answers && day.answers[q.id] != null);
@@ -134,14 +152,14 @@ function missedUnits(day) {
   });
   return out;
 }
-function calcStreak() {
+function calcStreak(P) {
   let streak = 0;
   let d = todayStr();
-  if (!mainDone(dayOf(d))) d = addDays(d, -1); // 今日が未実施なら昨日から数える
-  while (mainDone(dayOf(d))) { streak++; d = addDays(d, -1); }
+  if (!mainDone(dayOf(P, d))) d = addDays(d, -1); // 今日が未実施なら昨日から数える
+  while (mainDone(dayOf(P, d))) { streak++; d = addDays(d, -1); }
   return streak;
 }
-function unitStats() {
+function unitStats(P) {
   const stats = {}; // key: subject|unit -> {subject, unit, attempts, correct}
   function add(q, chosen, include) {
     if (!include || chosen == null) return;
@@ -150,8 +168,8 @@ function unitStats() {
     stats[k].attempts++;
     if (chosen === q.answer) stats[k].correct++;
   }
-  Object.keys(data.days).forEach((date) => {
-    const day = data.days[date];
+  Object.keys(P.days).forEach((date) => {
+    const day = P.days[date];
     (day.questions || []).forEach((q) => add(q, day.answers ? day.answers[q.id] : null, true));
     (day.extraSets || []).forEach((set) => {
       (set.questions || []).forEach((q, i) => add(q, set.answers ? set.answers[i] : null, true));
@@ -159,14 +177,14 @@ function unitStats() {
   });
   return Object.values(stats).sort((a, b) => (a.correct / a.attempts) - (b.correct / b.attempts));
 }
-function weeklyAccuracy() {
+function weeklyAccuracy(P) {
   const weeks = [];
   const thisMon = mondayOf(todayStr());
   for (let w = 0; w < 4; w++) {
     const mon = addDays(thisMon, -7 * w);
     let correct = 0;
     for (let i = 0; i < 7; i++) {
-      const day = dayOf(addDays(mon, i));
+      const day = dayOf(P, addDays(mon, i));
       if (day) (day.questions || []).forEach((q) => {
         const a = day.answers ? day.answers[q.id] : null;
         if (a != null && a === q.answer) correct++;
@@ -179,11 +197,11 @@ function weeklyAccuracy() {
   }
   return weeks; // [今週, 先週, ...]
 }
-function recentMissedUnits(daysBack) {
+function recentMissedUnits(P, daysBack) {
   const out = {}; // unit -> {subject, unit, count, lastDate}
   const from = addDays(todayStr(), -daysBack);
-  Object.keys(data.days).filter((d) => d >= from).forEach((date) => {
-    missedUnits(data.days[date]).forEach((m) => {
+  Object.keys(P.days).filter((d) => d >= from).forEach((date) => {
+    missedUnits(P.days[date]).forEach((m) => {
       const k = m.subject + '|' + m.unit;
       if (!out[k]) out[k] = { subject: m.subject, unit: m.unit, count: 0, lastDate: date };
       out[k].count++; out[k].lastDate = date;
@@ -197,11 +215,11 @@ function testWeek() {
   const mon = addDays(sun, -6);
   return { weekStart: mon, weekEnd: sun };
 }
-function testPool(weekStart) {
+function testPool(P, weekStart) {
   // その週の本編で間違えた問題（重複なし）
   const seen = {}, pool = [];
   for (let i = 0; i < 7; i++) {
-    const day = dayOf(addDays(weekStart, i));
+    const day = dayOf(P, addDays(weekStart, i));
     if (!day) continue;
     (day.questions || []).forEach((q) => {
       const a = day.answers ? day.answers[q.id] : null;
@@ -210,13 +228,13 @@ function testPool(weekStart) {
   }
   return pool;
 }
-function testVariantsFor(weekStart, subject, unit) {
-  return ((data.testVariants && data.testVariants[weekStart]) || []).filter((v) => v.subject === subject && v.unit === unit);
+function testVariantsFor(P, weekStart, subject, unit) {
+  return ((P.testVariants && P.testVariants[weekStart]) || []).filter((v) => v.subject === subject && v.unit === unit);
 }
-function testState() {
+function testState(P) {
   const { weekStart, weekEnd } = testWeek();
-  const rec = data.tests[weekStart] || { attempts: [], passed: false, lastPool: null };
-  const all = testPool(weekStart);
+  const rec = P.tests[weekStart] || { attempts: [], passed: false, lastPool: null };
+  const all = testPool(P, weekStart);
   let pool;
   if (rec.passed) pool = [];
   else if (rec.lastMissed && rec.lastMissed.length > 0) {
@@ -226,7 +244,7 @@ function testState() {
     const varIx = {};
     pool = [];
     rec.lastMissed.forEach((m) => {
-      const vars = testVariantsFor(weekStart, m.subject, m.unit);
+      const vars = testVariantsFor(P, weekStart, m.subject, m.unit);
       const fresh = vars.filter((v) => !used.has(v.id));
       const ix = varIx[m.subject + '|' + m.unit] || 0;
       varIx[m.subject + '|' + m.unit] = ix + 1;
@@ -632,6 +650,8 @@ function renderDash(){
     h += '<div class="card"><h2>設定</h2>';
     h += '<p class="hint">あいことば（お子さんがアプリを開くときに入力する言葉）。現在：'+(d.settings.playerPassSet?'設定済み':'未設定')+'</p>';
     h += '<input type="text" id="newpass" placeholder="新しいあいことば"><button class="sub" onclick="setPass()">あいことばを設定する</button>';
+    h += '<p class="hint" style="margin-top:14px">娘さんのあいことば（社会クイズ用）。現在：'+(d.settings.player2PassSet?'設定済み':'未設定')+'</p>';
+    h += '<input type="text" id="newpass2" placeholder="娘さんの新しいあいことば"><button class="sub" onclick="setPass2()">娘さんのあいことばを設定する</button>';
     h += '<p class="hint" style="margin-top:14px">イロ連携トークンを作り直す（古いトークンは使えなくなります）</p><button class="sub" onclick="regen()">トークンを再生成する</button>';
     h += '</div>';
     app.innerHTML = h;
@@ -642,6 +662,14 @@ function setPass(){
   if (!p) return;
   api('/api/admin/settings', {method:'POST', body:{playerPass:p}}).then(function(d){
     if (d.ok) { alert('あいことばを設定しました。お子さんに伝えてください'); renderDash(); }
+    else alert(d.error||'エラー');
+  });
+}
+function setPass2(){
+  var p = document.getElementById('newpass2').value.trim();
+  if (!p) return;
+  api('/api/admin/settings', {method:'POST', body:{player2Pass:p}}).then(function(d){
+    if (d.ok) { alert('娘さんのあいことばを設定しました'); renderDash(); }
     else alert(d.error||'エラー');
   });
 }
@@ -688,11 +716,11 @@ function answeredQuestion(q, chosen) {
 function cardOf(q, choice) {
   return { ok: true, correct: choice === q.answer, answer: q.answer, explanation: q.explanation, memoryTip: q.memoryTip, diagram: q.diagram || null };
 }
-function history14() {
+function history14(P) {
   const out = [];
   for (let i = 0; i < 14; i++) {
     const date = addDays(todayStr(), -i);
-    const day = dayOf(date);
+    const day = dayOf(P, date);
     const sc = mainScore(day);
     out.push({ date, hasQuestions: !!(day && day.questions && day.questions.length), done: mainDone(day), correct: sc ? sc.correct : 0, total: sc ? sc.total : 0 });
   }
@@ -721,20 +749,24 @@ const server = http.createServer(async (req, res) => {
     /* ---- プレイヤー ---- */
     if (req.method === 'POST' && p === '/api/player/login') {
       const body = await readBody(req);
-      if (!data.playerPassHash) return sendJson(res, 400, { ok: false, error: 'あいことばがまだ設定されていません' });
-      if (!verifySecret(body.pass || '', data.playerPassHash)) return sendJson(res, 401, { ok: false, error: 'あいことばが違います' });
+      if (!data.playerPassHash && !data.player2PassHash) return sendJson(res, 400, { ok: false, error: 'あいことばがまだ設定されていません' });
+      let who = null;
+      if (data.playerPassHash && verifySecret(body.pass || '', data.playerPassHash)) who = 'son';
+      else if (data.player2PassHash && verifySecret(body.pass || '', data.player2PassHash)) who = 'daughter';
+      if (!who) return sendJson(res, 401, { ok: false, error: 'あいことばが違います' });
       const t = newToken();
-      data.playerTokens.push(sha256(t));
-      if (data.playerTokens.length > 10) data.playerTokens = data.playerTokens.slice(-10);
+      data.playerTokens.push({ h: sha256(t), who });
+      if (data.playerTokens.length > 20) data.playerTokens = data.playerTokens.slice(-20);
       saveData();
-      return sendJson(res, 200, { ok: true, token: t });
+      return sendJson(res, 200, { ok: true, token: t, who });
     }
+    const P = p.startsWith('/api/player/') ? prof(playerWho(req)) : null;
     if (p.startsWith('/api/player/') && !isPlayer(req)) return sendJson(res, 401, { ok: false, error: 'ログインが必要です' });
 
     if (req.method === 'GET' && p === '/api/player/today') {
       const date = todayStr();
-      const day = dayOf(date);
-      const ts = testState();
+      const day = dayOf(P, date);
+      const ts = testState(P);
       const extraSets = day ? (day.extraSets || []) : [];
       const payload = {
         ok: true, date,
@@ -746,18 +778,18 @@ const server = http.createServer(async (req, res) => {
         done: mainDone(day),
         score: mainScore(day) || { correct: 0, answered: 0, total: 0 },
         missedUnits: missedUnits(day),
-        streak: calcStreak(),
+        streak: calcStreak(P),
         extra: { setsDone: extraSets.length },
         test: { available: ts.available, passed: ts.passed, needless: ts.needless, total: ts.pool.length, weekStart: ts.weekStart },
-        week: weeklyAccuracy(),
-        units: unitStats(),
-        history: history14(),
+        week: weeklyAccuracy(P),
+        units: unitStats(P),
+        history: history14(P),
       };
       return sendJson(res, 200, payload);
     }
     if (req.method === 'POST' && p === '/api/player/answer') {
       const body = await readBody(req);
-      const day = dayOf(todayStr());
+      const day = dayOf(P, todayStr());
       if (!day) return sendJson(res, 404, { ok: false, error: '今日の問題がありません' });
       const q = (day.questions || []).find((x) => x.id === body.qid);
       if (!q) return sendJson(res, 404, { ok: false, error: '問題が見つかりません' });
@@ -774,7 +806,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, out);
     }
     if (req.method === 'POST' && p === '/api/player/extra/start') {
-      const day = dayOf(todayStr());
+      const day = dayOf(P, todayStr());
       if (!day || !mainDone(day)) return sendJson(res, 400, { ok: false, error: 'まず今日の5問を解いてね' });
       if (!day.extraSets) day.extraSets = [];
       const used = day.extraSets.reduce((n, s) => n + (s.questions || []).length, 0);
@@ -786,7 +818,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/api/player/extra/answer') {
       const body = await readBody(req);
-      const day = dayOf(todayStr());
+      const day = dayOf(P, todayStr());
       if (!day || !day.extraSets || !day.extraSets[body.setIndex]) return sendJson(res, 404, { ok: false, error: 'セットが見つかりません' });
       const set = day.extraSets[body.setIndex];
       const ix = (set.questions || []).findIndex((x) => x.id === body.qid);
@@ -796,12 +828,12 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, cardOf(set.questions[ix], set.answers[ix]));
     }
     if (req.method === 'GET' && p === '/api/player/test') {
-      const ts = testState();
+      const ts = testState(P);
       return sendJson(res, 200, { ok: true, available: ts.available, passed: ts.passed, needless: ts.needless, questions: ts.pool.map(publicQuestion) });
     }
     if (req.method === 'POST' && p === '/api/player/test/answer') {
       const body = await readBody(req);
-      const ts = testState();
+      const ts = testState(P);
       const q = ts.pool.find((x) => x.id === body.qid);
       if (!q) return sendJson(res, 404, { ok: false, error: '問題が見つかりません' });
       if (!Number.isInteger(body.choice) || body.choice < 0 || body.choice > 3) return sendJson(res, 400, { ok: false, error: '答えが不正です' });
@@ -809,7 +841,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/api/player/test/finish') {
       const body = await readBody(req);
-      const ts = testState();
+      const ts = testState(P);
       if (!ts.available) return sendJson(res, 400, { ok: false, error: 'テストがありません' });
       const byId = {}; ts.pool.forEach((q) => { byId[q.id] = q; });
       let correct = 0; const missed = []; const missedEntries = [];
@@ -821,8 +853,8 @@ const server = http.createServer(async (req, res) => {
       });
       const total = ts.pool.length;
       const passed = total > 0 && correct / total >= 0.8;
-      if (!data.tests[ts.weekStart]) data.tests[ts.weekStart] = { attempts: [], passed: false, lastPool: null };
-      const rec = data.tests[ts.weekStart];
+      if (!P.tests[ts.weekStart]) P.tests[ts.weekStart] = { attempts: [], passed: false, lastPool: null };
+      const rec = P.tests[ts.weekStart];
       const muSeen = {}; const missedUnits = [];
       missedEntries.forEach((m) => { const k = m.subject + '|' + m.unit; if (!muSeen[k]) { muSeen[k] = true; missedUnits.push({ subject: m.subject, unit: m.unit }); } });
       rec.attempts.push({ date: todayStr(), correct, total, passed, missedUnits });
@@ -832,7 +864,7 @@ const server = http.createServer(async (req, res) => {
         rec.lastMissed = missedEntries;
         const servedVariantIds = ts.pool.filter((q) => q.isVariant).map((q) => q.id);
         rec.usedVariantIds = [...new Set([...(rec.usedVariantIds || []), ...servedVariantIds])];
-        const allVarIds = ((data.testVariants && data.testVariants[ts.weekStart]) || []).map((v) => v.id);
+        const allVarIds = ((P.testVariants && P.testVariants[ts.weekStart]) || []).map((v) => v.id);
         if (allVarIds.length > 0 && allVarIds.every((id) => rec.usedVariantIds.includes(id))) rec.usedVariantIds = servedVariantIds;
       }
       saveData();
@@ -865,24 +897,31 @@ const server = http.createServer(async (req, res) => {
     if (p.startsWith('/api/admin/') && !isAdmin(req)) return sendJson(res, 401, { ok: false, error: '認証が必要です' });
 
     if (req.method === 'GET' && p === '/api/admin/state') {
+      const P = prof('son');
       const date = todayStr();
-      const day = dayOf(date);
-      const tests = Object.keys(data.tests).sort().map((ws) => ({ weekStart: ws, passed: !!data.tests[ws].passed, attempts: (data.tests[ws].attempts || []).length }));
+      const day = dayOf(P, date);
+      const tests = Object.keys(P.tests).sort().map((ws) => ({ weekStart: ws, passed: !!P.tests[ws].passed, attempts: (P.tests[ws].attempts || []).length }));
       return sendJson(res, 200, {
         ok: true,
         today: { date, hasQuestions: !!(day && day.questions && day.questions.length), done: mainDone(day), score: mainScore(day) || { correct: 0, answered: 0, total: 0 }, missedUnits: missedUnits(day) },
-        streak: calcStreak(),
-        history: history14(),
-        units: unitStats(),
+        streak: calcStreak(P),
+        history: history14(P),
+        units: unitStats(P),
         tests,
-        settings: { playerPassSet: !!data.playerPassHash },
+        settings: { playerPassSet: !!data.playerPassHash, player2PassSet: !!data.player2PassHash },
       });
     }
     if (req.method === 'POST' && p === '/api/admin/settings') {
       const body = await readBody(req);
       if (typeof body.playerPass === 'string' && body.playerPass.length >= 2) {
         data.playerPassHash = hashSecret(body.playerPass);
-        data.playerTokens = [];
+        data.playerTokens = (data.playerTokens || []).filter((x) => typeof x !== 'string' && x.who === 'daughter');
+        saveData();
+        return sendJson(res, 200, { ok: true });
+      }
+      if (typeof body.player2Pass === 'string' && body.player2Pass.length >= 2) {
+        data.player2PassHash = hashSecret(body.player2Pass);
+        data.playerTokens = (data.playerTokens || []).filter((x) => typeof x === 'string' || x.who !== 'daughter');
         saveData();
         return sendJson(res, 200, { ok: true });
       }
@@ -911,7 +950,7 @@ const server = http.createServer(async (req, res) => {
       if (!body || !body.endpoint || !body.keys || !body.keys.p256dh || !body.keys.auth) return sendJson(res, 400, { ok: false, error: '購読の形式が不正です' });
       if (!Array.isArray(data.pushSubs)) data.pushSubs = [];
       data.pushSubs = data.pushSubs.filter((x) => x.endpoint !== body.endpoint);
-      data.pushSubs.push({ endpoint: body.endpoint, keys: { p256dh: body.keys.p256dh, auth: body.keys.auth }, created_at: new Date().toISOString() });
+      data.pushSubs.push({ endpoint: body.endpoint, keys: { p256dh: body.keys.p256dh, auth: body.keys.auth }, who: playerWho(req) || 'son', created_at: new Date().toISOString() });
       saveData();
       return sendJson(res, 200, { ok: true, count: data.pushSubs.length });
     }
@@ -923,17 +962,20 @@ const server = http.createServer(async (req, res) => {
       const wp = getWebPush();
       if (!wp) return sendJson(res, 500, { ok: false, error: 'push未設定' });
       const payload = JSON.stringify({ title: String(body.title || '毎朝5問クイズ'), body: String(body.body || ''), url: '/' });
-      const subs = Array.isArray(data.pushSubs) ? data.pushSubs : [];
+      const subsAll = Array.isArray(data.pushSubs) ? data.pushSubs : [];
+      const wantWho = body.player === 'daughter' ? 'daughter' : (body.player === 'son' ? 'son' : null);
+      const subs = wantWho ? subsAll.filter((x) => (x.who || 'son') === wantWho) : subsAll;
       let sent = 0; const dead = [];
       for (const sub of subs) {
         try { await wp.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, payload); sent++; }
         catch (e) { if (e && (e.statusCode === 404 || e.statusCode === 410)) dead.push(sub.endpoint); }
       }
-      if (dead.length) { data.pushSubs = subs.filter((x) => !dead.includes(x.endpoint)); saveData(); }
+      if (dead.length) { data.pushSubs = subsAll.filter((x) => !dead.includes(x.endpoint)); saveData(); }
       return sendJson(res, 200, { ok: true, sent, pruned: dead.length, total: subs.length });
     }
     if (req.method === 'POST' && p === '/api/agent/questions') {
       const body = await readBody(req);
+      const P = prof(body.player);
       const date = body.date;
       if (!validDateStr(date)) return sendJson(res, 400, { ok: false, error: 'date が不正です' });
       if (!Array.isArray(body.questions) || body.questions.length !== 5 || !body.questions.every(validQuestion)) {
@@ -941,34 +983,36 @@ const server = http.createServer(async (req, res) => {
       }
       const extra = Array.isArray(body.extraPool) ? body.extraPool : [];
       if (!extra.every(validQuestion)) return sendJson(res, 400, { ok: false, error: 'extraPool の形式が不正です' });
-      const existing = dayOf(date);
+      const existing = dayOf(P, date);
       if (existing && existing.answers && Object.keys(existing.answers).length > 0 && !body.force) {
         return sendJson(res, 409, { ok: false, error: 'その日はすでに回答が記録されています' });
       }
       const qs = body.questions.map((q, i) => ({ id: date + '-m' + (i + 1), subject: q.subject, unit: q.unit, q: q.q, choices: q.choices, answer: q.answer, explanation: q.explanation, memoryTip: q.memoryTip, diagram: cleanDiagram(q.diagram) }));
       const xs = extra.map((q, i) => ({ id: date + '-x' + (i + 1), subject: q.subject, unit: q.unit, q: q.q, choices: q.choices, answer: q.answer, explanation: q.explanation, memoryTip: q.memoryTip, diagram: cleanDiagram(q.diagram) }));
-      data.days[date] = { questions: qs, extraPool: xs, answers: {}, extraSets: [] };
+      P.days[date] = { questions: qs, extraPool: xs, answers: {}, extraSets: [] };
       saveData();
       return sendJson(res, 200, { ok: true, date, count: qs.length, extraCount: xs.length });
     }
     if (req.method === 'POST' && p === '/api/agent/test-variants') {
       const body = await readBody(req);
+      const P = prof(body.player);
       const weekStart = body.weekStart;
       if (!validDateStr(weekStart) || !Array.isArray(body.variants) || body.variants.length === 0 || !body.variants.every(validQuestion)) {
         return sendJson(res, 400, { ok: false, error: 'variants の形式が不正です' });
       }
-      if (!data.testVariants) data.testVariants = {};
-      if (!data.testVariants[weekStart]) data.testVariants[weekStart] = [];
-      const base = data.testVariants[weekStart].length;
+      if (!P.testVariants) P.testVariants = {};
+      if (!P.testVariants[weekStart]) P.testVariants[weekStart] = [];
+      const base = P.testVariants[weekStart].length;
       const vs = body.variants.map((q, i) => ({ id: weekStart + '-tv' + (base + i + 1), subject: q.subject, unit: q.unit, q: q.q, choices: q.choices, answer: q.answer, explanation: q.explanation, memoryTip: q.memoryTip, diagram: cleanDiagram(q.diagram), isVariant: true, originId: null }));
-      data.testVariants[weekStart].push(...vs);
+      P.testVariants[weekStart].push(...vs);
       saveData();
-      return sendJson(res, 200, { ok: true, weekStart, added: vs.length, total: data.testVariants[weekStart].length });
+      return sendJson(res, 200, { ok: true, weekStart, added: vs.length, total: P.testVariants[weekStart].length });
     }
     if (req.method === 'GET' && p === '/api/agent/results') {
+      const P = prof(url.searchParams.get('player'));
       const date = url.searchParams.get('date') || todayStr();
-      const day = dayOf(date);
-      const ts = testState();
+      const day = dayOf(P, date);
+      const ts = testState(P);
       return sendJson(res, 200, {
         ok: true, date,
         hasQuestions: !!(day && day.questions && day.questions.length),
@@ -977,18 +1021,19 @@ const server = http.createServer(async (req, res) => {
         missedUnits: missedUnits(day),
         extraSetsDone: day ? (day.extraSets || []).length : 0,
         finishedAt: day ? (day.finishedAt || null) : null,
-        streak: calcStreak(),
+        streak: calcStreak(P),
         testToday: ts.attempts.filter((a) => a.date === date),
       });
     }
     if (req.method === 'GET' && p === '/api/agent/summary') {
+      const P = prof(url.searchParams.get('player'));
       return sendJson(res, 200, {
-        ok: true, today: todayStr(), streak: calcStreak(),
-        recentMissed: recentMissedUnits(14),
-        units: unitStats(),
-        week: weeklyAccuracy(),
-        test: (() => { const ts = testState(); const rec = data.tests[ts.weekStart] || { attempts: [] }; const mu = {}; (rec.attempts || []).forEach((a) => (a.missedUnits || []).forEach((u) => { const k = u.subject + '|' + u.unit; if (!mu[k]) mu[k] = { subject: u.subject, unit: u.unit, count: 0 }; mu[k].count++; })); return { weekStart: ts.weekStart, available: ts.available, passed: ts.passed, needless: ts.needless, poolSize: ts.pool.length, testMissedUnits: Object.values(mu), variantsStored: ((data.testVariants && data.testVariants[ts.weekStart]) || []).length }; })(),
-        days: Object.keys(data.days).sort().slice(-14),
+        ok: true, today: todayStr(), streak: calcStreak(P),
+        recentMissed: recentMissedUnits(P, 14),
+        units: unitStats(P),
+        week: weeklyAccuracy(P),
+        test: (() => { const ts = testState(P); const rec = P.tests[ts.weekStart] || { attempts: [] }; const mu = {}; (rec.attempts || []).forEach((a) => (a.missedUnits || []).forEach((u) => { const k = u.subject + '|' + u.unit; if (!mu[k]) mu[k] = { subject: u.subject, unit: u.unit, count: 0 }; mu[k].count++; })); return { weekStart: ts.weekStart, available: ts.available, passed: ts.passed, needless: ts.needless, poolSize: ts.pool.length, testMissedUnits: Object.values(mu), variantsStored: ((P.testVariants && P.testVariants[ts.weekStart]) || []).length }; })(),
+        days: Object.keys(P.days).sort().slice(-14),
       });
     }
 
